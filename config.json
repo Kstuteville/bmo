@@ -1,5 +1,5 @@
 {
-  "text_model": "qwen2.5:3b",
+  "text_model": "qwen2.5:1.5b",
   "user_name": "Kaylie",
   "vision_model": "moondream",
   "voice_model": "piper/en_GB-semaine-medium.onnx",

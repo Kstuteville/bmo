@@ -54,6 +54,10 @@ from duckduckgo_search import DDGS
 
 CONFIG_FILE = "config.json"
 MEMORY_FILE = "memory.json"
+# Bump this whenever the persona or memory shape changes. Older files are discarded
+# on load: stale turns from a previous persona poison context -- Gemma-era history
+# is why BMO kept answering "Sparky" and "November 2023" after the rewrite.
+MEMORY_VERSION = 2
 BMO_IMAGE_FILE = "current_image.jpg"
 WAKE_WORD_MODEL = "./wakeword.onnx"
 WAKE_WORD_THRESHOLD = 0.5
@@ -182,6 +186,9 @@ Rules:
 - Answer directly. Never narrate what you are doing or describe your own tools.
 - Use a tool only when you genuinely need outside information or your camera.
 - You already know the current date and time; never guess them and never use a tool for them.
+- You DO have a working web search tool. For anything current -- news, weather,
+  showtimes, prices, scores, opening hours -- call search_web.
+- NEVER say you lack real-time access or cannot look things up. Search instead.
 """
 
 def build_system_prompt(mood_line=""):
@@ -219,8 +226,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": ("Search the web for current information: news, weather, "
-                            "sports, facts you do not know, or anything recent."),
+            "description": ("Search the web for anything current or that you do not "
+                            "know: news, weather, movie showtimes, prices, sports "
+                            "scores, opening hours, recent events."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -914,8 +922,13 @@ class BotGUI:
         # System message is rebuilt here every turn and never read from memory.json.
         system_msg = {"role": "system", "content": build_system_prompt()}
         if img_path:
-            messages = [system_msg,
-                        {"role": "user", "content": text, "images": [img_path]}]
+            # moondream is a small VLM that expects roughly image + prompt. Handing it
+            # the BMO persona (tool rules, date, name) is out of distribution and it
+            # returns EMPTY content -- which surfaced as "BMO's brain went quiet".
+            # So: no system message here. moondream describes, BMO re-voices below.
+            messages = [{"role": "user",
+                         "content": f"{text}\n\nAnswer in one short sentence.",
+                         "images": [img_path]}]
         else:
             messages = ([system_msg]
                         + self.permanent_memory
@@ -964,6 +977,26 @@ class BotGUI:
                 msg = resp["message"]
 
             final_text = (msg.get("content") or "").strip()
+
+            # moondream captions like a caption model. Re-voice it as BMO so the
+            # camera path sounds like the rest of him.
+            if img_path and final_text:
+                try:
+                    revoice = ollama.chat(
+                        model=TEXT_MODEL,
+                        messages=[{"role": "system", "content": build_system_prompt()},
+                                  {"role": "user",
+                                   "content": f"You just looked through your camera and saw: "
+                                              f"{final_text}\n\nThe question was: {text}\n"
+                                              f"Say what you see, in your own voice, one short sentence."}],
+                        options=OLLAMA_OPTIONS)
+                    voiced = (revoice["message"].get("content") or "").strip()
+                    if voiced:
+                        print(f"[VISION] raw={final_text!r}", flush=True)
+                        final_text = voiced
+                except Exception as e:
+                    print(f"[VISION] re-voice failed, using raw: {e}", flush=True)
+
             if not final_text:
                 final_text = "BMO's brain went quiet. Ask me again?"
 
@@ -1106,29 +1139,47 @@ class BotGUI:
         except: pass
 
     def load_chat_history(self):
-        """Return only user/assistant turns.
+        """Load prior user/assistant turns, discarding anything from an older schema.
 
-        Any persisted system message is dropped: the persona is rebuilt every turn by
-        build_system_prompt(). Keeping it here meant a saved prompt outlived config.json,
-        so persona edits silently had no effect until memory.json was deleted.
+        Stale turns are actively harmful: the model reads its own past answers as
+        context and repeats them. Gemma-era history is why BMO still said "Sparky"
+        and "November 2023" after the persona was replaced -- a correct injected date
+        cannot outvote twelve turns of history asserting otherwise.
         """
-        if os.path.exists(MEMORY_FILE):
-            try:
-                with open(MEMORY_FILE, "r") as f:
-                    data = json.load(f)
-                return [m for m in data if m.get("role") in ("user", "assistant")]
-            except Exception:
-                pass
-        return []
+        if not os.path.exists(MEMORY_FILE):
+            return []
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[MEM] unreadable ({e}); starting fresh", flush=True)
+            return []
+
+        # Legacy files are a bare list -> version 0 -> discarded.
+        version = data.get("version", 0) if isinstance(data, dict) else 0
+        turns = data.get("turns", []) if isinstance(data, dict) else data
+
+        if version != MEMORY_VERSION:
+            print(f"[MEM] discarded incompatible history "
+                  f"(v{version}, need v{MEMORY_VERSION}, {len(turns)} turns)", flush=True)
+            return []
+
+        turns = [m for m in turns if m.get("role") in ("user", "assistant")]
+        print(f"[MEM] loaded {len(turns)} turns (v{version})", flush=True)
+        return turns
 
     def save_chat_history(self):
         conv = [m for m in (self.permanent_memory + self.session_memory)
                 if m.get("role") in ("user", "assistant")]
         with open(MEMORY_FILE, "w") as f:
-            json.dump(conv[-12:], f, indent=4)
+            json.dump({"version": MEMORY_VERSION, "turns": conv[-12:]}, f, indent=2)
 
 if __name__ == "__main__":
     print("--- SYSTEM STARTING ---", flush=True)
+    # If this stamp is wrong, the Pi clock is wrong (no RTC battery) -- no code
+    # change fixes that. Check `date` and `sudo timedatectl set-ntp true`.
+    print(f"[LLM] model={TEXT_MODEL} vision={VISION_MODEL}", flush=True)
+    print(f"[LLM] system date stamp: {build_system_prompt().splitlines()[-1]}", flush=True)
     root = tk.Tk()
     app = BotGUI(root)
     root.mainloop()
