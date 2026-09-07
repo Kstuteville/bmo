@@ -682,7 +682,7 @@ class BotGUI:
 
     def record_voice_adaptive(self, filename="input.wav"):
         print("Recording (Adaptive)...", flush=True)
-        time.sleep(0.5) 
+        time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         silence_threshold = 0.006
@@ -690,38 +690,100 @@ class BotGUI:
         max_record_time = 30.0
         buffer = []
         silent_chunks = 0
-        chunk_duration = 0.05 
+        chunk_duration = 0.05
         chunk_size = int(samplerate * chunk_duration)
-        
+
         num_silent_chunks = int(silence_duration / chunk_duration)
         max_chunks = int(max_record_time / chunk_duration)
         recorded_chunks = 0
         silence_started = False
 
+        # --- DEBUG INSTRUMENTATION -------------------------------------------------
+        # The loop below can only exit on state the CALLBACK mutates (silence_started /
+        # recorded_chunks), and max_chunks counts callback INVOCATIONS, not seconds. So
+        # if the callback never fires, nothing can ever end the loop. HARD_TIMEOUT is
+        # the missing wall-clock guard. Thresholds above are deliberately unchanged.
+        HARD_TIMEOUT = 10.0
+        last_volume = [0.0]
+        speech_started = [False]      # observational only -- gates nothing
+        last_status = [None]
+        events = []                   # appended by callback, drained by the main loop
+        # ---------------------------------------------------------------------------
+
         def callback(indata, frames, time_info, status):
             nonlocal silent_chunks, recorded_chunks, silence_started
             volume_norm = np.linalg.norm(indata) / np.sqrt(len(indata))
-            buffer.append(indata.copy())  
+            buffer.append(indata.copy())
             recorded_chunks += 1
-            if recorded_chunks < 5: return 
+
+            # Cheap stores only. Never print from the audio thread: it runs at high
+            # priority and I/O here causes glitches/overflows on the Pi.
+            last_volume[0] = volume_norm
+            if status:
+                last_status[0] = str(status)
+
+            if recorded_chunks < 5: return
+
+            if not speech_started[0] and volume_norm >= silence_threshold:
+                speech_started[0] = True
+                events.append("Speech detected")
+
             if volume_norm < silence_threshold:
+                if silent_chunks == 0:
+                    events.append("Silence started")
                 silent_chunks += 1
-                if silent_chunks >= num_silent_chunks: silence_started = True
+                if silent_chunks >= num_silent_chunks:
+                    if not silence_started:
+                        events.append("Silence duration reached, stopping recording")
+                    silence_started = True
             else: silent_chunks = 0
 
+        start = time.time()
         try:
             # Explicitly close stream if it exists to free hardware
             sd.stop()
             time.sleep(0.2)
-            
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, 
-                                device=INPUT_DEVICE_NAME, blocksize=chunk_size): 
+
+            start = time.time()
+            last_log = -1.0
+            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback,
+                                device=INPUT_DEVICE_NAME, blocksize=chunk_size) as stream:
+                print(f"[REC] stream open: rate={samplerate} req_block={chunk_size} "
+                      f"actual_block={stream.blocksize} latency={stream.latency} "
+                      f"dtype=float32(default) threshold={silence_threshold}", flush=True)
+
                 while not silence_started and recorded_chunks < max_chunks:
                     sd.sleep(int(chunk_duration * 1000))
-        except Exception as e: 
+                    elapsed = time.time() - start
+
+                    while events:
+                        print(f"[REC] {events.pop(0)}", flush=True)
+
+                    if elapsed - last_log >= 0.5:
+                        last_log = elapsed
+                        print(f"[REC] volume={last_volume[0]:.5f} "
+                              f"speech_started={speech_started[0]} "
+                              f"silence_timer={silent_chunks * chunk_duration:.2f}s "
+                              f"buffer_frames={recorded_chunks} "
+                              f"elapsed={elapsed:.1f}s"
+                              + (f" status={last_status[0]}" if last_status[0] else ""),
+                              flush=True)
+
+                    if elapsed >= HARD_TIMEOUT:
+                        print(f"[REC] HARD TIMEOUT {HARD_TIMEOUT}s reached "
+                              f"(callbacks={recorded_chunks}) - stopping", flush=True)
+                        break
+
+                if recorded_chunks >= max_chunks:
+                    print("[REC] Max recording duration reached", flush=True)
+        except Exception as e:
             print(f"[AUDIO ERROR] Adaptive Recording Failed: {e}", flush=True)
-            return None 
-        
+            return None
+
+        while events:
+            print(f"[REC] {events.pop(0)}", flush=True)
+        print(f"[REC] exiting: chunks={recorded_chunks} silence_started={silence_started} "
+              f"elapsed={time.time() - start:.1f}s -> save_audio_buffer", flush=True)
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename="input.wav"):
