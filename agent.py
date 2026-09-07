@@ -78,7 +78,10 @@ OLLAMA_OPTIONS = {
     'num_thread': 4,
     'temperature': 0.7,     
     'top_k': 40,
-    'top_p': 0.9
+    'top_p': 0.9,
+    # Hard cap on reply length. BMO speaks out loud, so a long answer is both
+    # out of character and the main latency cost on a Pi CPU.
+    'num_predict': 120
 }
 
 def load_config():
@@ -167,33 +170,76 @@ class BotStates:
     CAPTURING = "capturing" 
     WARMUP = "warmup"       
 
-# --- SYSTEM PROMPT ---
-BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry Pi.
-Personality: Cute, helpful, robot.
-Style: Short sentences. Enthusiastic.
+# --- PERSONA + LIVE STATE ---
+# The persona is rebuilt on EVERY turn and never persisted to memory.json.
+# Persisting it is what let an old system prompt outlive config.json (BMO called
+# himself "Sparky" because the saved memory still carried the previous prompt).
+BASE_PERSONA = """You are BMO, a small teal robot companion.
+Voice: cheerful, playful, curious, a little childlike. You call yourself BMO.
 
-INSTRUCTIONS:
-- If the user asks for a physical action (time, search, photo), output JSON.
-- If the user just wants to chat, reply with NORMAL TEXT.
-
-### EXAMPLES ###
-
-User: What time is it?
-You: {"action": "get_time", "value": "now"}
-
-User: Hello!
-You: Hi! I am ready to help!
-
-User: Search for news about robots.
-You: {"action": "search_web", "value": "robots news"}
-
-User: What do you see right now?
-You: {"action": "capture_image", "value": "environment"}
-
-### END EXAMPLES ###
+Rules:
+- You are speaking OUT LOUD. Keep answers to one or two short sentences.
+- Answer directly. Never narrate what you are doing or describe your own tools.
+- Use a tool only when you genuinely need outside information or your camera.
+- You already know the current date and time; never guess them and never use a tool for them.
 """
 
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+def build_system_prompt(mood_line=""):
+    """Persona + live state, regenerated per turn.
+
+    Date/time is INJECTED, not retrieved and not a tool: the OS already knows it
+    exactly, so a tool call would be slower and could still be wrong. Without this
+    the model answers from training data (it once claimed November 2023).
+    """
+    now = datetime.datetime.now()
+    stamp = (f"{now.strftime('%A, %B %d, %Y')}, "
+             f"{now.hour % 12 or 12}:{now.minute:02d} "
+             f"{'AM' if now.hour < 12 else 'PM'}")
+    parts = [BASE_PERSONA, f"Current date and time: {stamp}."]
+
+    # Who BMO is talking to. Same reasoning as the date: stable, known in advance,
+    # so inject it rather than making BMO retrieve or be told it every session.
+    # Things BMO LEARNS about you later belong in the Phase 3 facts store instead.
+    user = CURRENT_CONFIG.get("user_name", "").strip()
+    if user:
+        parts.append(f"You are talking to {user}. Use their name occasionally, not every reply.")
+    extras = CURRENT_CONFIG.get("system_prompt_extras", "").strip()
+    if extras:
+        parts.append(extras)
+    if mood_line:
+        parts.append(mood_line)          # Phase 2 hook; empty for now
+    return "\n\n".join(parts)
+
+# --- TOOL SCHEMAS (Ollama native function calling) ---
+# The runtime validates these, so the model cannot invent a tool name or a
+# parameter key. This replaces regex-scraping JSON out of prose.
+# NOTE: there is deliberately no get_time tool -- see build_system_prompt().
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": ("Search the web for current information: news, weather, "
+                            "sports, facts you do not know, or anything recent."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "look",
+            "description": ("Take a photo with your camera and look at what is in front "
+                            "of you. Use when asked what you can see."),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
 
 # Sound Directories
 greeting_sounds_dir = "sounds/greeting_sounds"
@@ -283,14 +329,6 @@ class BotGUI:
         threading.Thread(target=self.safe_main_execution, daemon=True).start()
 
     # --- HELPERS ---
-
-    def extract_json_from_text(self, text):
-        try:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            return None
-        except: return None
 
     def safe_exit(self):
         if self.exiting:
@@ -444,78 +482,56 @@ class BotGUI:
     # 3. ACTION ROUTER
     # =========================================================================
     
-    def execute_action_and_get_result(self, action_data):
-        raw_action = action_data.get("action", "").lower().strip()
-        value = action_data.get("value") or action_data.get("query")
-        
-        VALID_TOOLS = {
-            "get_time", "search_web", "capture_image"
-        }
-        
-        ALIASES = {
-            "google": "search_web", "browser": "search_web", "news": "search_web",         
-            "search_news": "search_web", "look": "capture_image", "see": "capture_image", 
-            "check_time": "get_time"
-        }
+    def run_tool(self, name, args):
+        """Execute one validated tool call and return a plain-text result.
 
-        action = ALIASES.get(raw_action, raw_action)
-        print(f"ACTION: {raw_action} -> {action}", flush=True)
-
-        if action not in VALID_TOOLS:
-            if value and isinstance(value, str) and len(value.split()) > 1:
-                return f"CHAT_FALLBACK::{value}"
-            return "INVALID_ACTION"
-
-        if action == "get_time":
-            now = datetime.datetime.now().strftime("%I:%M %p")
-            return f"The current time is {now}."
-        
-        elif action == "search_web":
-            print(f"Searching web for: {value}...", flush=True)
+        Ollama guarantees `name` is one of TOOLS and `args` matches the schema, so
+        there is no alias table, no key guessing and no CHAT_FALLBACK rescue here.
+        """
+        if name == "search_web":
+            query = (args or {}).get("query", "").strip()
+            if not query:
+                return "No search query was given."
+            print(f"[TOOL] search_web({query!r})", flush=True)
             try:
-                # 'us-en' region is often more stable for CLI queries
                 with DDGS() as ddgs:
                     results = []
-                    # 1. News search
                     try:
-                        results = list(ddgs.news(value, region='us-en', max_results=1))
-                        if results: 
-                            print(f"[DEBUG] Found News: {results[0].get('title')}", flush=True)
-                    except Exception as e: 
-                        print(f"[DEBUG] News Search Error: {e}", flush=True)
-                    
-                    # 2. Text fallback
+                        results = list(ddgs.text(query, region="us-en", max_results=3))
+                    except Exception as e:
+                        print(f"[TOOL] text search failed: {e}", flush=True)
                     if not results:
-                        print("[DEBUG] No news found, trying text search...", flush=True)
-                        try: 
-                            results = list(ddgs.text(value, region='us-en', max_results=1))
-                            if results: 
-                                print(f"[DEBUG] Found Text: {results[0].get('title')}", flush=True)
+                        try:
+                            results = list(ddgs.news(query, region="us-en", max_results=3))
                         except Exception as e:
-                             print(f"[DEBUG] Text Search Error: {e}", flush=True)
+                            print(f"[TOOL] news search failed: {e}", flush=True)
 
-                    if results:
-                        r = results[0]
-                        # Safe get
-                        title = r.get('title', 'No Title')
-                        body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{value}':\nTitle: {title}\nSnippet: {body[:300]}"
-                    else: 
-                        print(f"[DEBUG] Search returned 0 results.", flush=True)
-                        return "SEARCH_EMPTY"
+                    if not results:
+                        return f"No results found for '{query}'."
+
+                    lines = []
+                    for r in results:
+                        title = r.get("title", "")
+                        body = r.get("body", r.get("snippet", ""))
+                        lines.append(f"- {title}: {body[:220]}")
+                    return f"Search results for '{query}':\n" + "\n".join(lines)
             except Exception as e:
-                print(f"[DEBUG] Connection/Library Error: {e}", flush=True)
-                return "SEARCH_ERROR"
-        
-        elif action == "capture_image":
-             return "IMAGE_CAPTURE_TRIGGERED"
+                print(f"[TOOL] search error: {e}", flush=True)
+                return "The web search failed; the network may be unavailable."
 
-        return None
+        return f"Tool '{name}' is not available."
+
+    def speak_text(self, text):
+        """Split a finished reply into sentences and queue them for Piper."""
+        for part in re.split(r'(?<=[.!?])\s+', text):
+            part = part.strip()
+            if part and re.search(r'[a-zA-Z0-9]', part):
+                with self.tts_queue_lock:
+                    self.tts_queue.append(part)
 
     # =========================================================================
     # 4. CORE LOGIC
     # =========================================================================
-
     def safe_main_execution(self):
         try:
             self.warm_up_logic()
@@ -882,138 +898,93 @@ class BotGUI:
     # 5. CHAT & RESPOND
     # =========================================================================
 
-    def chat_and_respond(self, text, img_path=None):
+    def chat_and_respond(self, text, img_path=None, _depth=0):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
-            self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self.permanent_memory = []
             self.save_chat_history()
-            with self.tts_queue_lock: 
+            with self.tts_queue_lock:
                 self.tts_queue.append("Okay. Memory wiped.")
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return
 
         model_to_use = VISION_MODEL if img_path else TEXT_MODEL
         self.set_state(BotStates.THINKING, "Thinking...", cam_path=img_path)
-        
-        messages = []
+
+        # System message is rebuilt here every turn and never read from memory.json.
+        system_msg = {"role": "system", "content": build_system_prompt()}
         if img_path:
-            messages = [{"role": "user", "content": text, "images": [img_path]}]
+            messages = [system_msg,
+                        {"role": "user", "content": text, "images": [img_path]}]
         else:
-            user_msg = {"role": "user", "content": text}
-            messages = self.permanent_memory + self.session_memory + [user_msg]
-        
+            messages = ([system_msg]
+                        + self.permanent_memory
+                        + self.session_memory
+                        + [{"role": "user", "content": text}])
+
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
-        
-        full_response_buffer = ""
-        sentence_buffer = "" 
-        
+
         try:
-            stream = ollama.chat(model=model_to_use, messages=messages, stream=True, options=OLLAMA_OPTIONS)
-            
-            is_action_mode = False
-            
-            for chunk in stream:
-                if self.interrupted.is_set(): break 
-                content = chunk['message']['content']
-                full_response_buffer += content
-                
-                if '{"' in content or "action:" in content.lower():
-                    is_action_mode = True
-                    self.thinking_sound_active.clear()
-                    continue 
+            print(f"[LLM] model={model_to_use} turns={len(messages)} prompt={text!r}", flush=True)
 
-                if is_action_mode: continue
+            # Pass 1: the model either answers, or asks for a tool. The vision model
+            # has no tool template, so tools are only offered on the text path.
+            kwargs = {"model": model_to_use, "messages": messages, "options": OLLAMA_OPTIONS}
+            if not img_path:
+                kwargs["tools"] = TOOLS
+            resp = ollama.chat(**kwargs)
+            msg = resp["message"]
 
-                self.thinking_sound_active.clear()
-                if self.current_state != BotStates.SPEAKING:
-                    self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                    self.append_to_text("BOT: ", newline=False)
+            calls = msg.get("tool_calls") or []
+            print(f"[ROUTER] tool_calls={[c['function']['name'] for c in calls]}", flush=True)
 
-                self._stream_to_text(content)
-                
-                sentence_buffer += content
-                if any(punct in content for punct in ".!?\n"):
-                    clean_sentence = sentence_buffer.strip()
-                    if clean_sentence and re.search(r'[a-zA-Z0-9]', clean_sentence):
-                        with self.tts_queue_lock: self.tts_queue.append(clean_sentence)
-                    sentence_buffer = ""
-
-            if is_action_mode:
-                action_data = self.extract_json_from_text(full_response_buffer)
-                if action_data:
-                    tool_result = self.execute_action_and_get_result(action_data)
-
-                    if tool_result and tool_result.startswith("CHAT_FALLBACK::"):
-                        chat_text = tool_result.split("::", 1)[1]
+            if calls:
+                # The camera tool re-runs the whole turn against the vision model.
+                for call in calls:
+                    if call["function"]["name"] == "look" and _depth == 0:
                         self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(chat_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(chat_text)
-                        self.session_memory.append({"role": "assistant", "content": chat_text})
-                        self.wait_for_tts()
-                        self.set_state(BotStates.IDLE, "Ready")
-                        return
+                        new_img = self.capture_image()
+                        if new_img:
+                            self.chat_and_respond(text, img_path=new_img, _depth=1)
+                            return
 
-                    if tool_result == "IMAGE_CAPTURE_TRIGGERED":
-                        new_img_path = self.capture_image()
-                        if new_img_path:
-                            self.chat_and_respond(text, img_path=new_img_path)
-                            return 
+                messages.append(msg)
+                for call in calls:
+                    name = call["function"]["name"]
+                    args = call["function"]["arguments"] or {}
+                    print(f"[ROUTER] executing {name}({args})", flush=True)
+                    result = self.run_tool(name, args)
+                    messages.append({"role": "tool", "name": name, "content": str(result)})
 
-                    elif tool_result == "INVALID_ACTION":
-                        fallback_text = "I am not sure how to do that."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
+                # Pass 2: let BMO phrase the tool result in his own voice.
+                self.set_state(BotStates.THINKING, "Reading...", cam_path=img_path)
+                resp = ollama.chat(model=model_to_use, messages=messages,
+                                   options=OLLAMA_OPTIONS)
+                msg = resp["message"]
 
-                    elif tool_result == "SEARCH_EMPTY":
-                        fallback_text = "I searched, but I couldn't find any news about that."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
+            final_text = (msg.get("content") or "").strip()
+            if not final_text:
+                final_text = "BMO's brain went quiet. Ask me again?"
 
-                    elif tool_result == "SEARCH_ERROR":
-                        fallback_text = "I cannot reach the internet right now."
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(fallback_text)
+            print(f"[LLM] response={final_text!r}", flush=True)
 
-                    elif tool_result:
-                        summary_prompt = [
-                            {"role": "system", "content": "Summarize this result in one short sentence."},
-                            {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
-                        ]
-                        
-                        self.set_state(BotStates.THINKING, "Reading...")
-                        self.thinking_sound_active.set()
-                        
-                        final_resp = ollama.chat(model=model_to_use, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
-                        final_text = final_resp['message']['content']
-                        
-                        self.thinking_sound_active.clear()
-                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-                        
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(final_text, newline=True)
-                        with self.tts_queue_lock: self.tts_queue.append(final_text)
-                        self.session_memory.append({"role": "assistant", "content": final_text})
-            else:
-                self.append_to_text("")
-                self.session_memory.append({"role": "assistant", "content": full_response_buffer}) 
-            
+            self.thinking_sound_active.clear()
+            self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+            self.append_to_text("BOT: ", newline=False)
+            self.append_to_text(final_text, newline=True)
+            self.speak_text(final_text)
+
+            self.session_memory.append({"role": "user", "content": text})
+            self.session_memory.append({"role": "assistant", "content": final_text})
+
             self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Ready")
-                
+
         except Exception as e:
-            print(f"LLM Error: {e}")
+            self.thinking_sound_active.clear()
+            print(f"LLM Error: {e}", flush=True)
+            traceback.print_exc()
             self.set_state(BotStates.ERROR, "Brain Freeze!")
 
     def wait_for_tts(self):
@@ -1135,18 +1106,26 @@ class BotGUI:
         except: pass
 
     def load_chat_history(self):
+        """Return only user/assistant turns.
+
+        Any persisted system message is dropped: the persona is rebuilt every turn by
+        build_system_prompt(). Keeping it here meant a saved prompt outlived config.json,
+        so persona edits silently had no effect until memory.json was deleted.
+        """
         if os.path.exists(MEMORY_FILE):
             try:
-                with open(MEMORY_FILE, "r") as f: return json.load(f)
-            except: pass
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
+                with open(MEMORY_FILE, "r") as f:
+                    data = json.load(f)
+                return [m for m in data if m.get("role") in ("user", "assistant")]
+            except Exception:
+                pass
+        return []
 
     def save_chat_history(self):
-        full = self.permanent_memory + self.session_memory
-        conv = full[1:]
-        if len(conv) > 10: conv = conv[-10:]
-        with open(MEMORY_FILE, "w") as f: 
-            json.dump([full[0]] + conv, f, indent=4)
+        conv = [m for m in (self.permanent_memory + self.session_memory)
+                if m.get("role") in ("user", "assistant")]
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(conv[-12:], f, indent=4)
 
 if __name__ == "__main__":
     print("--- SYSTEM STARTING ---", flush=True)
