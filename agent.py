@@ -29,6 +29,8 @@ import datetime
 import warnings
 import wave
 import struct 
+import queue
+import math
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
@@ -565,134 +567,117 @@ class BotGUI:
     def detect_wake_word_or_ptt(self):
         self.set_state(BotStates.IDLE, "Waiting...")
         self.ptt_event.clear()
-        
-        if self.oww_model: self.oww_model.reset()
 
         if self.oww_model is None:
             self.ptt_event.wait()
             self.ptt_event.clear()
             return "PTT"
 
-        CHUNK_SIZE = 1280
-        OWW_SAMPLE_RATE = 16000
-
+        self.oww_model.reset()
         input_rate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
-        use_resampling = (input_rate != OWW_SAMPLE_RATE)
-        input_chunk_size = int(CHUNK_SIZE * (input_rate / OWW_SAMPLE_RATE)) if use_resampling else CHUNK_SIZE
+
+        # Let ALSA release the PCM from the previous turn (TTS playback / recording) before
+        # opening capture. Same guard record_voice_* uses at agent.py:725 / :749.
+        # NOTE: this is a STARTUP guard only. We never close and reopen the device to
+        # recover from an overflow -- doing that is what produced -9999.
+        try:
+            sd.stop()
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+        try:
+            return self._listen_loop(input_rate)
+        except Exception as e:
+            print(f"[CRITICAL] Wake Word Stream Error: {e}", flush=True)
+            traceback.print_exc()
+            self.ptt_event.wait()
+            self.ptt_event.clear()
+            return "PTT"
+
+    def _listen_loop(self, input_rate):
+        """Callback-driven wake word capture with a ring buffer.
+
+        PortAudio fills audio_q from its own high-priority audio thread; this loop drains
+        it. Capture is decoupled from ONNX inference, so slow prediction grows the queue
+        instead of overflowing the ALSA ring buffer. An overflow is logged and NEVER tears
+        the stream down.
+        """
+        OWW_RATE = 16000
+        OWW_FRAME = 1280        # openWakeWord requires EXACTLY this many samples @ 16 kHz
+
+        # Raw input samples that map to exactly one model frame: 44100 -> 3528, 48000 -> 3840.
+        # Deliberately independent of whatever blocksize PortAudio hands us, so an odd or
+        # unexpected device block size can no longer distort the model's time base.
+        in_per_frame = OWW_FRAME * input_rate // OWW_RATE
+        g = math.gcd(OWW_RATE, input_rate)
+        up, down = OWW_RATE // g, input_rate // g      # 44100 -> 160/441
+
+        audio_q = queue.Queue(maxsize=64)              # ~1s of slack, bounded
+        overflowed = threading.Event()
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                overflowed.set()                       # consumer logs it; never fatal
+            try:
+                audio_q.put_nowait(indata.copy())      # PortAudio reuses indata
+            except queue.Full:
+                pass                                   # drop, rather than stall the audio thread
 
         stream_args = {
-            "samplerate": input_rate, 
-            "channels": 1, 
-            "dtype": 'int16', 
-            "blocksize": input_chunk_size, 
+            "samplerate": input_rate,
+            "channels": 1,
+            "dtype": "int16",
+            "blocksize": 0,                            # let PortAudio pick a period ALSA likes
             "device": INPUT_DEVICE_NAME,
-            "latency": "high",   # larger ALSA ring buffer; a wake word is not latency-critical
+            "callback": callback,
         }
 
-        # Try to find a compatible block size and sample rate
-        try:
-            # First attempt: standard settings
-            self._listen_loop(stream_args, input_chunk_size, CHUNK_SIZE, use_resampling)
-        except StopIteration as si:
-            return str(si)
-        except Exception as e:
-            print(f"[AUDIO] Stream failed with defaults: {e}. Retrying with loose settings...", flush=True)
-            try:
-                # Second attempt: Let PortAudio decide blocksize (0) and latency
-                stream_args["blocksize"] = 0 
-                stream_args["latency"] = "high"
-                # If blocksize is variable, we must read specific amounts manually or handle buffering.
-                # Simplest fallback: Just attempt small fixed block
-                stream_args["blocksize"] = 1024
-                use_resampling = True
-                
-                self._listen_loop(stream_args, 1024, CHUNK_SIZE, use_resampling)
-            except StopIteration as si:
-                return str(si)
-            except Exception as e2:
-                print(f"[CRITICAL] Wake Word Stream Error: {e2}")
-                self.ptt_event.wait()
-                return "PTT"
-        
-        return "WAKE"
+        pending = np.zeros(0, dtype=np.int16)
 
-    def _listen_loop(self, stream_args, input_chunk_size, target_chunk_size, use_resampling):
-        # Force software backend (no mmap) via environment variable if possible, 
-        # but here we can try to hint loop settings.
-        # However, the most effective fix for ALSA mmap issues is often just asking for 'blocksize=0' 
-        # and letting portaudio manage the buffering, OR very small chunks.
-        
-        # Let's try to be less aggressive with reads.
-        
-         with sd.InputStream(**stream_args) as stream:
-                print(f"[AUDIO] Listening with rate {stream_args['samplerate']} and block {stream_args['blocksize']}", flush=True)
-                
-                # Pre-allocate buffer for speed
-                # If blocksize is 0, we read what is available.
-                
-                while True:
-                    if self.ptt_event.is_set():
-                        self.ptt_event.clear()
-                        raise StopIteration("PTT")
+        with sd.InputStream(**stream_args) as stream:
+            # Diagnostic: this line definitively explains any future block-size anomaly.
+            print(f"[AUDIO] rate={input_rate} stream_block={stream.blocksize} "
+                  f"latency={stream.latency} in_per_frame={in_per_frame} "
+                  f"resample={up}/{down} -> {OWW_FRAME}", flush=True)
 
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.001)
-                    if rlist: 
-                        sys.stdin.readline()
-                        raise StopIteration("CLI")
+            while True:
+                if self.ptt_event.is_set():
+                    self.ptt_event.clear()
+                    return "PTT"
 
-                    # If fallback mode (blocksize 0), read fixed amount
-                    read_size = input_chunk_size
-                    if stream_args.get('blocksize') == 0:
-                        read_size = 1024 # Safe small read
-                    
-                    try:
-                        data, overflow = stream.read(read_size)
-                        if overflow:
-                            # A dropped block is a hiccup, not a fatal condition. Raising here
-                            # tore down the stream and sent us into the broken fallback path,
-                            # which reopens the PCM with no settle delay and dies with -9999.
-                            print("!", end="", flush=True)
-                    except Exception as e:
-                        # Convert uncatchable PaErrorCode wrapper to standard Exception if needed
-                        # But honestly, `raise e` should work... unless it's a SystemExit?
-                        # Let's wrap it in a new exception to be sure it bubbles up
-                        raise RuntimeError(f"Audio read failed: {e}")
+                rlist, _, _ = select.select([sys.stdin], [], [], 0)
+                if rlist:
+                    sys.stdin.readline()
+                    return "CLI"
 
-                    audio_data = np.frombuffer(data, dtype=np.int16)
+                try:
+                    block = audio_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-                    # Ensure flattening for openwakeword compatibility
-                    if audio_data.ndim > 1:
-                        audio_data = audio_data.flatten()
+                if overflowed.is_set():
+                    overflowed.clear()
+                    print("!", end="", flush=True)
 
-                    if use_resampling:
-                        # resample_poly is polyphase FIR: properly anti-aliased and ~10x cheaper
-                        # than the FFT-based scipy.signal.resample this originally rejected as
-                        # too slow. 44100 -> 16000 reduces to 160/441 (scipy reduces internally).
-                        # The old nearest-neighbour slicing aliased badly and reset the
-                        # resampling phase on every block.
-                        audio_data = np.clip(
-                            scipy.signal.resample_poly(audio_data, target_chunk_size, len(audio_data)),
-                            -32768, 32767).astype(np.int16)
-                    
-                    # Convert to float for model prediction without needing heavy resampling logic
-                    # The wake word model needs 16000, which we just faked above.
-                    
-                    # Debug volume occasionally
-                    current_max = np.max(np.abs(audio_data))
-                    
-                    # openWakeWord is a STREAMING model: it must see every consecutive frame,
+                pending = np.concatenate((pending, block.reshape(-1)))
+
+                while len(pending) >= in_per_frame:
+                    raw, pending = pending[:in_per_frame], pending[in_per_frame:]
+                    frame = np.clip(scipy.signal.resample_poly(raw, up, down),
+                                    -32768, 32767).astype(np.int16)
+
+                    # openWakeWord is a streaming model: feed every consecutive frame,
                     # silence included, or its melspectrogram/embedding history is corrupted.
-                    # The old `if current_max > 200` gate fed it only mid-speech audio.
-                    prediction = self.oww_model.predict(audio_data)
+                    self.oww_model.predict(frame)
                     for mdl in self.oww_model.prediction_buffer.keys():
                         score = list(self.oww_model.prediction_buffer[mdl])[-1]
-                        if score > 0.1: # Show potential triggers
-                            print(f"\r[Oww] Score: {score:.3f} | Vol: {current_max}   ", end="", flush=True)
-
+                        if score > 0.1:
+                            print(f"\r[Oww] {mdl}: {score:.3f}   ", end="", flush=True)
                         if score > WAKE_WORD_THRESHOLD:
                             print(f"\n[WAKE] Triggered on '{mdl}' with score: {score:.2f}", flush=True)
                             self.oww_model.reset()
-                            return # Success
+                            return "WAKE"
 
 
     def record_voice_adaptive(self, filename="input.wav"):
