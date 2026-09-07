@@ -585,7 +585,8 @@ class BotGUI:
             "channels": 1, 
             "dtype": 'int16', 
             "blocksize": input_chunk_size, 
-            "device": INPUT_DEVICE_NAME
+            "device": INPUT_DEVICE_NAME,
+            "latency": "high",   # larger ALSA ring buffer; a wake word is not latency-critical
         }
 
         # Try to find a compatible block size and sample rate
@@ -647,11 +648,10 @@ class BotGUI:
                     try:
                         data, overflow = stream.read(read_size)
                         if overflow:
-                            print("!", end="", flush=True) 
-                            # If we overflow excessively, raise error to trigger fallback to SAFE MODE (PulseAudio/Software)
-                            # We can use a simple counter attached to the function or object, but here raising immediately 
-                            # after a few in a row is safest.
-                            raise RuntimeError("Audio Buffer Overflow - Triggering Safe Mode")
+                            # A dropped block is a hiccup, not a fatal condition. Raising here
+                            # tore down the stream and sent us into the broken fallback path,
+                            # which reopens the PCM with no settle delay and dies with -9999.
+                            print("!", end="", flush=True)
                     except Exception as e:
                         # Convert uncatchable PaErrorCode wrapper to standard Exception if needed
                         # But honestly, `raise e` should work... unless it's a SystemExit?
@@ -665,11 +665,14 @@ class BotGUI:
                         audio_data = audio_data.flatten()
 
                     if use_resampling:
-                        # FAST RESAMPLING: Nearest-neighbor slicing instead of scipy.signal.resample
-                        # This avoids the CPU bottleneck that causes overflow (!!!!!!!) on Raspberry Pi
-                        step = len(audio_data) / target_chunk_size
-                        indices = np.arange(0, len(audio_data), step)[:target_chunk_size].astype(int)
-                        audio_data = audio_data[indices]
+                        # resample_poly is polyphase FIR: properly anti-aliased and ~10x cheaper
+                        # than the FFT-based scipy.signal.resample this originally rejected as
+                        # too slow. 44100 -> 16000 reduces to 160/441 (scipy reduces internally).
+                        # The old nearest-neighbour slicing aliased badly and reset the
+                        # resampling phase on every block.
+                        audio_data = np.clip(
+                            scipy.signal.resample_poly(audio_data, target_chunk_size, len(audio_data)),
+                            -32768, 32767).astype(np.int16)
                     
                     # Convert to float for model prediction without needing heavy resampling logic
                     # The wake word model needs 16000, which we just faked above.
@@ -677,18 +680,19 @@ class BotGUI:
                     # Debug volume occasionally
                     current_max = np.max(np.abs(audio_data))
                     
-                    # Only predict if volume is significant to save CPU
-                    if current_max > 200: 
-                        prediction = self.oww_model.predict(audio_data)
-                        for mdl in self.oww_model.prediction_buffer.keys():
-                            score = list(self.oww_model.prediction_buffer[mdl])[-1]
-                            if score > 0.1: # Show potential triggers
-                                print(f"\r[Oww] Score: {score:.3f} | Vol: {current_max}   ", end="", flush=True)
+                    # openWakeWord is a STREAMING model: it must see every consecutive frame,
+                    # silence included, or its melspectrogram/embedding history is corrupted.
+                    # The old `if current_max > 200` gate fed it only mid-speech audio.
+                    prediction = self.oww_model.predict(audio_data)
+                    for mdl in self.oww_model.prediction_buffer.keys():
+                        score = list(self.oww_model.prediction_buffer[mdl])[-1]
+                        if score > 0.1: # Show potential triggers
+                            print(f"\r[Oww] Score: {score:.3f} | Vol: {current_max}   ", end="", flush=True)
 
-                            if score > WAKE_WORD_THRESHOLD:
-                                print(f"\n[WAKE] Triggered on '{mdl}' with score: {score:.2f}", flush=True)
-                                self.oww_model.reset() 
-                                return # Success
+                        if score > WAKE_WORD_THRESHOLD:
+                            print(f"\n[WAKE] Triggered on '{mdl}' with score: {score:.2f}", flush=True)
+                            self.oww_model.reset()
+                            return # Success
 
 
     def record_voice_adaptive(self, filename="input.wav"):
