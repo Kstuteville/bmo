@@ -813,12 +813,26 @@ class BotGUI:
         if not buffer: return None
         audio_data = np.concatenate(buffer, axis=0).flatten()
         audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        audio_data = (audio_data * 32767).astype(np.int16)
+        peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
+
+        # whisper.cpp REQUIRES 16 kHz mono WAV and rejects any other rate outright --
+        # the complaint goes to stderr and stdout comes back empty, which surfaced as
+        # Heard: ''. The mic captures at 44100, so resample before writing.
+        WHISPER_RATE = 16000
+        if samplerate != WHISPER_RATE:
+            g = math.gcd(WHISPER_RATE, samplerate)
+            audio_data = scipy.signal.resample_poly(audio_data, WHISPER_RATE // g, samplerate // g)
+            samplerate = WHISPER_RATE
+
+        audio_data = np.clip(audio_data * 32767, -32768, 32767).astype(np.int16)
         with wave.open(filename, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(samplerate)
             wf.writeframes(audio_data.tobytes())
+        print(f"[REC] saved={os.path.abspath(filename)} "
+              f"duration={len(audio_data) / float(samplerate):.2f}s "
+              f"peak={peak:.4f} rate={samplerate}", flush=True)
         self.play_sound(self.get_random_sound(ack_sounds_dir))
         return filename
 
@@ -835,6 +849,15 @@ class BotGUI:
                 if ']' in last_line: transcription = last_line.split("]")[1].strip()
                 else: transcription = last_line
             else: transcription = ""
+
+            # stderr was always captured here but discarded, so ANY whisper failure
+            # (missing binary, missing model, bad rate) looked identical to silence.
+            if result.returncode != 0 or not transcription:
+                print(f"[STT] rc={result.returncode}", flush=True)
+                err = (result.stderr or "").strip()
+                if err:
+                    print(f"[STT] stderr: {err[-500:]}", flush=True)
+
             print(f"Heard: '{transcription}'", flush=True)
             return transcription.strip()
         except Exception as e:
