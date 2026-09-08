@@ -58,6 +58,9 @@ MEMORY_FILE = "memory.json"
 # on load: stale turns from a previous persona poison context -- Gemma-era history
 # is why BMO kept answering "Sparky" and "November 2023" after the rewrite.
 MEMORY_VERSION = 2
+# How many past messages (not exchanges) to send. Each exchange is 2. Small models pay
+# for every token of prompt, so this is the main latency dial that is not the model itself.
+MEMORY_TURNS = 8   # overridden by config below
 BMO_IMAGE_FILE = "current_image.jpg"
 WAKE_WORD_MODEL = "./wakeword.onnx"
 WAKE_WORD_THRESHOLD = 0.5
@@ -101,6 +104,7 @@ def load_config():
 
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
+MEMORY_TURNS = int(CURRENT_CONFIG.get("memory_turns", MEMORY_TURNS))
 VISION_MODEL = CURRENT_CONFIG["vision_model"]
 
 def resolve_input_device(config):
@@ -178,20 +182,17 @@ class BotStates:
 # The persona is rebuilt on EVERY turn and never persisted to memory.json.
 # Persisting it is what let an old system prompt outlive config.json (BMO called
 # himself "Sparky" because the saved memory still carried the previous prompt).
-BASE_PERSONA = """You are BMO, a small teal robot companion.
-Voice: cheerful, playful, curious, a little childlike. You call yourself BMO.
+BASE_PERSONA = """You are BMO, a small teal robot companion. Cheerful, playful, a little childlike.
 
 Rules:
-- You are speaking OUT LOUD. Keep answers to one or two short sentences.
-- Answer directly. Never narrate what you are doing or describe your own tools.
-- Use a tool only when you genuinely need outside information or your camera.
-- You already know the current date and time; never guess them and never use a tool for them.
-- You DO have a working web search tool. For anything current -- news, weather,
-  showtimes, prices, scores, opening hours -- call search_web.
-- NEVER say you lack real-time access or cannot look things up. Search instead.
-- NEVER ask permission to use a tool. Do not say "would you like me to look that up?"
-  Just look it up and answer in the same turn.
-"""
+- You speak OUT LOUD. One or two short sentences, always.
+- Answer directly. Never narrate your actions or mention your tools.
+- You know the date and time already. Never guess them, never use a tool for them.
+- Use a tool ONLY when you truly need outside info or your camera. Things you already
+  know (maths, facts, chat) need no tool.
+- But when you DO need one, just use it. Never ask permission, never say you lack
+  real-time access.
+- Anything current (news, weather, showtimes, prices, scores, hours) needs search_web."""
 
 def build_system_prompt(mood_line=""):
     """Persona + live state, regenerated per turn.
@@ -968,10 +969,11 @@ class BotGUI:
                          "content": f"{text}\n\nAnswer in one short sentence.",
                          "images": [img_path]}]
         else:
-            messages = ([system_msg]
-                        + self.permanent_memory
-                        + self.session_memory
-                        + [{"role": "user", "content": text}])
+            # Cap the working context. permanent_memory (up to 12 turns from disk) plus
+            # an UNBOUNDED session_memory was reaching 18+ messages for a 4-word question;
+            # on a Pi CPU prompt processing then dominates the whole response time.
+            history = (self.permanent_memory + self.session_memory)[-MEMORY_TURNS:]
+            messages = [system_msg] + history + [{"role": "user", "content": text}]
 
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
@@ -984,8 +986,10 @@ class BotGUI:
             kwargs = {"model": model_to_use, "messages": messages, "options": OLLAMA_OPTIONS}
             if not img_path:
                 kwargs["tools"] = TOOLS
+            _t0 = time.time()
             resp = ollama.chat(**kwargs)
             msg = resp["message"]
+            print(f"[LLM] pass1 {time.time() - _t0:.1f}s", flush=True)
 
             calls = msg.get("tool_calls") or []
             print(f"[ROUTER] tool_calls={[c['function']['name'] for c in calls]}", flush=True)
@@ -1010,9 +1014,11 @@ class BotGUI:
 
                 # Pass 2: let BMO phrase the tool result in his own voice.
                 self.set_state(BotStates.THINKING, "Reading...", cam_path=img_path)
+                _t1 = time.time()
                 resp = ollama.chat(model=model_to_use, messages=messages,
                                    options=OLLAMA_OPTIONS)
                 msg = resp["message"]
+                print(f"[LLM] pass2 {time.time() - _t1:.1f}s", flush=True)
 
             final_text = (msg.get("content") or "").strip()
 
