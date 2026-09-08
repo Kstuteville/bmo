@@ -189,6 +189,8 @@ Rules:
 - You DO have a working web search tool. For anything current -- news, weather,
   showtimes, prices, scores, opening hours -- call search_web.
 - NEVER say you lack real-time access or cannot look things up. Search instead.
+- NEVER ask permission to use a tool. Do not say "would you like me to look that up?"
+  Just look it up and answer in the same turn.
 """
 
 def build_system_prompt(mood_line=""):
@@ -228,7 +230,8 @@ TOOLS = [
             "name": "search_web",
             "description": ("Search the web for anything current or that you do not "
                             "know: news, weather, movie showtimes, prices, sports "
-                            "scores, opening hours, recent events."),
+                            "scores, opening hours, recent events. Call this "
+                            "immediately; never ask the user for permission first."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -546,35 +549,54 @@ class BotGUI:
             self.tts_active.set()
             self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True)
             self.tts_thread.start()
-            
+
+            follow_up_secs = CURRENT_CONFIG.get("follow_up_seconds", 6)
+
             while True:
+                # --- outer loop: one wake-word session ---
                 trigger_source = self.detect_wake_word_or_ptt()
                 if self.interrupted.is_set():
                     self.interrupted.clear()
                     self.set_state(BotStates.IDLE, "Resetting...")
                     continue
 
-                self.set_state(BotStates.LISTENING, "I'm listening!")
-                
-                audio_file = None
-                if trigger_source == "PTT":
-                    audio_file = self.record_voice_ptt()
-                else:
-                    audio_file = self.record_voice_adaptive()
-                
-                if not audio_file: 
-                    self.set_state(BotStates.IDLE, "Heard nothing.")
-                    continue
-                
-                user_text = self.transcribe_audio(audio_file)
-                if not user_text:
-                    self.set_state(BotStates.IDLE, "Transcription empty.")
-                    continue
-                
-                self.append_to_text(f"YOU: {user_text}")
-                self.interrupted.clear()
-                self.chat_and_respond(user_text, img_path=None)
-                    
+                follow_up = False
+                while True:
+                    # --- inner loop: one conversation, no wake word between turns ---
+                    if follow_up:
+                        # BMO just spoke. Listen briefly for a reply; if the room stays
+                        # quiet, fall back to requiring the wake word again.
+                        self.set_state(BotStates.LISTENING, "Still listening...")
+                        audio_file = self.record_voice_adaptive(wait_for_speech=follow_up_secs)
+                    else:
+                        self.set_state(BotStates.LISTENING, "I'm listening!")
+                        audio_file = (self.record_voice_ptt() if trigger_source == "PTT"
+                                      else self.record_voice_adaptive())
+
+                    if not audio_file:
+                        if not follow_up:
+                            self.set_state(BotStates.IDLE, "Heard nothing.")
+                        break
+
+                    user_text = self.transcribe_audio(audio_file)
+                    if not user_text:
+                        if not follow_up:
+                            self.set_state(BotStates.IDLE, "Transcription empty.")
+                        break
+
+                    self.append_to_text(f"YOU: {user_text}")
+                    self.interrupted.clear()
+                    self.chat_and_respond(user_text, img_path=None)
+
+                    # Spacebar interrupt must escape the conversation, not just the reply.
+                    if self.interrupted.is_set():
+                        self.interrupted.clear()
+                        break
+
+                    follow_up = True
+
+                self.set_state(BotStates.IDLE, "Waiting...")
+
         except Exception as e:
             traceback.print_exc()
             self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
@@ -704,7 +726,13 @@ class BotGUI:
                             return "WAKE"
 
 
-    def record_voice_adaptive(self, filename="input.wav"):
+    def record_voice_adaptive(self, filename="input.wav", wait_for_speech=None):
+        """Record until ~1.5s of silence.
+
+        wait_for_speech: if set, give up and return None when speech has not STARTED
+        within that many seconds. Used for the follow-up window after BMO speaks, so a
+        silent room returns to wake-word mode instead of banking room tone.
+        """
         print("Recording (Adaptive)...", flush=True)
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
@@ -762,6 +790,7 @@ class BotGUI:
                     silence_started = True
             else: silent_chunks = 0
 
+        abandoned = False
         start = time.time()
         try:
             # Explicitly close stream if it exists to free hardware
@@ -793,6 +822,12 @@ class BotGUI:
                               + (f" status={last_status[0]}" if last_status[0] else ""),
                               flush=True)
 
+                    if wait_for_speech and not speech_started[0] and elapsed >= wait_for_speech:
+                        print(f"[REC] no follow-up within {wait_for_speech}s "
+                              f"-> back to wake word", flush=True)
+                        abandoned = True
+                        break
+
                     if elapsed >= HARD_TIMEOUT:
                         print(f"[REC] HARD TIMEOUT {HARD_TIMEOUT}s reached "
                               f"(callbacks={recorded_chunks}) - stopping", flush=True)
@@ -806,6 +841,9 @@ class BotGUI:
 
         while events:
             print(f"[REC] {events.pop(0)}", flush=True)
+        if abandoned:
+            return None
+
         print(f"[REC] exiting: chunks={recorded_chunks} silence_started={silence_started} "
               f"elapsed={time.time() - start:.1f}s -> save_audio_buffer", flush=True)
         return self.save_audio_buffer(buffer, filename, samplerate)
