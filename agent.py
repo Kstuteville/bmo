@@ -237,6 +237,14 @@ def build_system_prompt(mood_line=""):
         parts.append(mood_line)          # Phase 2 hook; empty for now
     return "\n\n".join(parts)
 
+# Calendar questions are pre-routed past the model entirely. qwen2.5:1.5b will not
+# reliably emit a tool_call for them -- it invents events instead ("special meeting with
+# friends"). Matching here means the model never gets to decide, so it cannot invent.
+# It is also FASTER: skips the tool-decision pass, so one model call instead of two.
+CALENDAR_RE = re.compile(
+    r"\b(calendar|schedule|agenda|meeting|meetings|appointment|appointments"
+    r"|class|classes|plans)\b", re.I)
+
 # --- TOOL SCHEMAS (Ollama native function calling) ---
 # The runtime validates these, so the model cannot invent a tool name or a
 # parameter key. This replaces regex-scraping JSON out of prose.
@@ -364,6 +372,20 @@ def events_for_day(day="today"):
     now = datetime.datetime.now(tz=_local_tz())
     target = (now + datetime.timedelta(days=1)).date() if str(day).lower().startswith("tomorrow") else now.date()
     return [e for e in fetch_events() if e["start"].date() == target]
+
+def format_agenda(events, day="today", who=""):
+    """Build the spoken calendar answer with no model involved.
+
+    Step 4 (LLM phrasing) is removed for calendar deliberately: it was the only
+    stochastic link in an otherwise exact chain, and the one place a wrong answer
+    actually costs the user something. This is 100% accurate and instant.
+    """
+    lead = f"Okay {who}! " if who else "Okay! "
+    if not events:
+        return f"{lead}Nothing on your calendar {day}."
+    parts = [f"{e['summary']} at {describe_time(e['start'])}." for e in events]
+    n = len(parts)
+    return f"{lead}You have {n} thing{'s' if n != 1 else ''} {day}. " + " Then ".join(parts)
 
 def describe_time(dt):
     return f"{dt.hour % 12 or 12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
@@ -915,12 +937,15 @@ class BotGUI:
         time.sleep(0.5)
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
+        # Thresholds are MEASURED from the room at the start of every recording, not
+        # hardcoded. A fixed 0.006 was tuned once against one ALSA gain in one room and
+        # silently drifted out of alignment whenever any of that changed.
+        CALIB_CHUNKS = 8                 # ~0.4s; audio is still captured, nothing is lost
+        NOISE_FLOOR_MIN, NOISE_FLOOR_MAX = 0.002, 0.025
+        calib = []
+        # Sensible defaults until calibration completes on the first few chunks.
         silence_threshold = 0.006
-        # Separate, higher bar for deciding speech has STARTED. Reusing silence_threshold
-        # for both meant a chair creak or passing car (>0.006) flipped speech_started,
-        # after which the follow-up abandon check could never fire and BMO sat listening
-        # for the full 10s. Real speech peaks ~0.10, so 0.015 clears room blips easily.
-        speech_threshold = silence_threshold * 2.5
+        speech_threshold = 0.015
         silence_duration = 1.5
         max_record_time = 30.0
         buffer = []
@@ -947,6 +972,7 @@ class BotGUI:
 
         def callback(indata, frames, time_info, status):
             nonlocal silent_chunks, recorded_chunks, silence_started
+            nonlocal silence_threshold, speech_threshold
             volume_norm = np.linalg.norm(indata) / np.sqrt(len(indata))
             buffer.append(indata.copy())
             recorded_chunks += 1
@@ -957,7 +983,21 @@ class BotGUI:
             if status:
                 last_status[0] = str(status)
 
-            if recorded_chunks < 5: return
+            # --- calibration window ---
+            if recorded_chunks <= CALIB_CHUNKS:
+                calib.append(volume_norm)
+                if recorded_chunks == CALIB_CHUNKS:
+                    # 25th percentile, not the mean: an early word shouldn't inflate the
+                    # floor. The clamp stops a calibration taken mid-speech from producing
+                    # absurd thresholds.
+                    floor = float(np.percentile(calib, 25))
+                    floor = max(NOISE_FLOOR_MIN, min(NOISE_FLOOR_MAX, floor))
+                    silence_threshold = floor * 1.6
+                    speech_threshold = floor * 3.0
+                    events.append(f"noise_floor={floor:.4f} "
+                                  f"silence<{silence_threshold:.4f} "
+                                  f"speech>={speech_threshold:.4f}")
+                return
 
             if not speech_started[0] and volume_norm >= speech_threshold:
                 speech_started[0] = True
@@ -1164,6 +1204,26 @@ class BotGUI:
             history = (self.permanent_memory + self.session_memory)[-MEMORY_TURNS:]
             messages = [system_msg] + history + [{"role": "user", "content": text}]
 
+        # --- calendar: answered entirely without the model ---
+        if not img_path and CALENDAR_RE.search(text):
+            day = "tomorrow" if "tomorrow" in text.lower() else "today"
+            print(f"[PREROUTE] calendar -> get_agenda({day})", flush=True)
+            events = events_for_day(day)
+            print(f"[PREROUTE] {len(events)} events, answering without the model", flush=True)
+
+            final_text = format_agenda(events, day,
+                                       CURRENT_CONFIG.get("user_name", "").strip())
+            self.set_state(BotStates.SPEAKING, "Speaking...")
+            self.append_to_text("BOT: ", newline=False)
+            self.append_to_text(final_text, newline=True)
+            self.speak_text(final_text)
+            self.session_memory.append({"role": "user", "content": text})
+            self.session_memory.append({"role": "assistant", "content": final_text})
+            self.last_reply_was_question = False
+            self.wait_for_tts()
+            self.set_state(BotStates.IDLE, "Ready")
+            return
+
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
 
@@ -1232,6 +1292,7 @@ class BotGUI:
 
             if not final_text:
                 final_text = "BMO's brain went quiet. Ask me again?"
+
 
             # Only keep the mic open if BMO actually needs an answer back. Lingering
             # after every reply made him feel like he never went to sleep.
