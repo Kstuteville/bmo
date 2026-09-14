@@ -6,3 +6,5 @@ onnxruntime
 ollama
 duckduckgo-search
 Pillow
+icalendar
+recurring-ical-events

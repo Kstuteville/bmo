@@ -20,6 +20,11 @@ piper/
 # Exception: Un-comment the line below if you WANT to share your custom wake word
 # !wakeword.onnx
 
+# --- Secrets ---
+# Holds the private Google Calendar iCal URL. That URL is a password:
+# anyone with it can read your calendar. NEVER commit this file.
+secrets.json
+
 # --- User Configuration & Memory ---
 # Keep chat history local (Privacy)
 memory.json

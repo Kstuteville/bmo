@@ -53,6 +53,9 @@ from duckduckgo_search import DDGS
 # =========================================================================
 
 CONFIG_FILE = "config.json"
+# secrets.json is gitignored and merged OVER config.json. The calendar iCal URL is a
+# password -- anyone holding it can read the calendar -- and config.json is tracked.
+SECRETS_FILE = "secrets.json"
 MEMORY_FILE = "memory.json"
 # Bump this whenever the persona or memory shape changes. Older files are discarded
 # on load: stale turns from a previous persona poison context -- Gemma-era history
@@ -76,7 +79,10 @@ DEFAULT_CONFIG = {
     "camera_rotation": 0,
     "system_prompt_extras": "",
     "input_device": None,
-    "input_sample_rate": None
+    "input_sample_rate": None,
+    "calendar_ics_url": "",          # put the real one in secrets.json, not here
+    "reminder_lead_minutes": 30,
+    "calendar_poll_minutes": 5
 }
 
 # LLM SETTINGS
@@ -100,6 +106,15 @@ def load_config():
                 config.update(user_config)
         except Exception as e:
             print(f"Config Error: {e}. Using defaults.")
+
+    if os.path.exists(SECRETS_FILE):
+        try:
+            with open(SECRETS_FILE, "r") as f:
+                secrets = json.load(f)
+            config.update({k: v for k, v in secrets.items() if not k.startswith("_")})
+            print(f"[CFG] merged {SECRETS_FILE}", flush=True)
+        except Exception as e:
+            print(f"[CFG] {SECRETS_FILE} unreadable: {e}", flush=True)
     return config
 
 CURRENT_CONFIG = load_config()
@@ -245,6 +260,19 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_agenda",
+            "description": "Look at the user's calendar for a day.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string", "description": "'today' or 'tomorrow'"}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "look",
             "description": ("Take a photo with your camera and look at what is in front "
                             "of you. Use when asked what you can see."),
@@ -258,6 +286,83 @@ greeting_sounds_dir = "sounds/greeting_sounds"
 ack_sounds_dir = "sounds/ack_sounds"
 thinking_sounds_dir = "sounds/thinking_sounds"
 error_sounds_dir = "sounds/error_sounds"
+
+# =========================================================================
+# CALENDAR (read-only, via Google's secret iCal URL -- no OAuth)
+# =========================================================================
+# Google's push notifications are webhooks needing a public HTTPS endpoint, which a
+# Pi behind a home router does not have. So we poll the .ics feed and fire our own
+# reminders from each event's start time. Note the feed is cached by Google and can
+# lag a few minutes behind live edits.
+
+_CAL_CACHE = {"fetched_at": None, "events": []}
+
+def _local_tz():
+    return datetime.datetime.now().astimezone().tzinfo
+
+def fetch_events(force=False):
+    """Return today's and tomorrow's events as [{uid, summary, start}] in local time.
+
+    Soft-fails to [] on every error: the calendar is an enhancement, and BMO must keep
+    working as a normal assistant with no URL, no network, or a malformed feed.
+    """
+    url = (CURRENT_CONFIG.get("calendar_ics_url") or "").strip()
+    if not url:
+        return []
+
+    poll_min = int(CURRENT_CONFIG.get("calendar_poll_minutes", 5))
+    now = datetime.datetime.now(tz=_local_tz())
+    if (not force and _CAL_CACHE["fetched_at"]
+            and (now - _CAL_CACHE["fetched_at"]).total_seconds() < poll_min * 60):
+        return _CAL_CACHE["events"]
+
+    try:
+        import icalendar
+        import recurring_ical_events
+        import urllib.request
+
+        with urllib.request.urlopen(url, timeout=15) as r:
+            raw = r.read()
+        cal = icalendar.Calendar.from_ical(raw)
+
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + datetime.timedelta(days=2)
+        # Expands RRULE into real occurrences -- without this, recurring meetings
+        # (standups, weeklies) would silently never produce a reminder.
+        occurrences = recurring_ical_events.of(cal).between(start, end)
+
+        events = []
+        for ev in occurrences:
+            dt = ev.get("DTSTART").dt
+            if not isinstance(dt, datetime.datetime):       # all-day event
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_local_tz())
+            events.append({
+                "uid": f"{ev.get('UID', '')}-{dt.isoformat()}",
+                "summary": str(ev.get("SUMMARY", "something")),
+                "start": dt.astimezone(_local_tz()),
+            })
+        events.sort(key=lambda e: e["start"])
+
+        _CAL_CACHE["fetched_at"] = now
+        _CAL_CACHE["events"] = events
+        print(f"[CAL] fetched {len(events)} events", flush=True)
+        return events
+
+    except ImportError as e:
+        print(f"[CAL] missing dependency ({e}); run ./setup.sh", flush=True)
+    except Exception as e:
+        print(f"[CAL] fetch failed: {e}", flush=True)
+    return []
+
+def events_for_day(day="today"):
+    now = datetime.datetime.now(tz=_local_tz())
+    target = (now + datetime.timedelta(days=1)).date() if str(day).lower().startswith("tomorrow") else now.date()
+    return [e for e in fetch_events() if e["start"].date() == target]
+
+def describe_time(dt):
+    return f"{dt.hour % 12 or 12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
 
 # =========================================================================
 # 2. GUI CLASS
@@ -291,6 +396,9 @@ class BotGUI:
         
         self.last_ptt_time = 0 
         self.ptt_event = threading.Event()       
+        self.interject_event = threading.Event()   # set by the reminder ticker
+        self.announced = set()                     # event uids already announced
+        self.pending_interjection = None
         self.recording_active = threading.Event() 
         self.interrupted = threading.Event() 
         
@@ -337,6 +445,7 @@ class BotGUI:
 
         self.load_animations()
         self.update_animation() 
+        self.master.after(15_000, self.check_reminders)
         
         threading.Thread(target=self.safe_main_execution, daemon=True).start()
 
@@ -494,6 +603,38 @@ class BotGUI:
     # 3. ACTION ROUTER
     # =========================================================================
     
+    def check_reminders(self):
+        """Tk ticker: announce calendar events coming up, once each.
+
+        Deliberately bypasses the LLM -- no model call, no latency, and no chance of a
+        1.5B model garbling the time.
+        """
+        try:
+            # Never talk over a conversation; just wait for the next tick.
+            if self.current_state != BotStates.IDLE or self.pending_interjection:
+                return
+
+            lead = int(CURRENT_CONFIG.get("reminder_lead_minutes", 30))
+            now = datetime.datetime.now(tz=_local_tz())
+
+            for ev in events_for_day("today"):
+                if ev["uid"] in self.announced:
+                    continue
+                mins = (ev["start"] - now).total_seconds() / 60.0
+                if 0 < mins <= lead:
+                    self.announced.add(ev["uid"])
+                    who = CURRENT_CONFIG.get("user_name", "").strip()
+                    lead_in = f"{who}! " if who else ""
+                    self.pending_interjection = (
+                        f"{lead_in}{ev['summary']} in {int(round(mins))} minutes.")
+                    print(f"[CAL] reminder due: {self.pending_interjection}", flush=True)
+                    self.interject_event.set()
+                    break
+        except Exception as e:
+            print(f"[CAL] reminder check failed: {e}", flush=True)
+        finally:
+            self.master.after(30_000, self.check_reminders)
+
     def run_tool(self, name, args):
         """Execute one validated tool call and return a plain-text result.
 
@@ -531,6 +672,15 @@ class BotGUI:
                 print(f"[TOOL] search error: {e}", flush=True)
                 return "The web search failed; the network may be unavailable."
 
+        if name == "get_agenda":
+            day = (args or {}).get("day", "today")
+            print(f"[TOOL] get_agenda({day!r})", flush=True)
+            evs = events_for_day(day)
+            if not evs:
+                return f"Nothing on the calendar {day}."
+            parts = [f"{e['summary']} at {describe_time(e['start'])}" for e in evs]
+            return f"Calendar for {day}: " + "; ".join(parts)
+
         return f"Tool '{name}' is not available."
 
     def speak_text(self, text):
@@ -556,6 +706,21 @@ class BotGUI:
             while True:
                 # --- outer loop: one wake-word session ---
                 trigger_source = self.detect_wake_word_or_ptt()
+
+                # A reminder fired. Speak it, then fall through to reopen the wake-word
+                # stream -- no conversation follows unless the user says the wake word.
+                if trigger_source == "INTERJECT":
+                    self.interject_event.clear()
+                    line = self.pending_interjection or ""
+                    self.pending_interjection = None
+                    if line:
+                        self.set_state(BotStates.SPEAKING, "Reminder!")
+                        self.append_to_text(f"BOT: {line}")
+                        self.speak_text(line)
+                        self.wait_for_tts()
+                    self.set_state(BotStates.IDLE, "Waiting...")
+                    continue
+
                 if self.interrupted.is_set():
                     self.interrupted.clear()
                     self.set_state(BotStates.IDLE, "Resetting...")
@@ -594,7 +759,9 @@ class BotGUI:
                         self.interrupted.clear()
                         break
 
-                    follow_up = True
+                    follow_up = getattr(self, "last_reply_was_question", False)
+                    if not follow_up:
+                        break                      # straight back to the wake word
 
                 self.set_state(BotStates.IDLE, "Waiting...")
 
@@ -693,6 +860,12 @@ class BotGUI:
                     self.ptt_event.clear()
                     return "PTT"
 
+                # A reminder is due. Exit the same way PTT does so the `with` block
+                # closes the stream; detect_wake_word_or_ptt reopens it afterwards
+                # with the sd.stop() + settle guard already in place.
+                if self.interject_event.is_set():
+                    return "INTERJECT"
+
                 rlist, _, _ = select.select([sys.stdin], [], [], 0)
                 if rlist:
                     sys.stdin.readline()
@@ -739,6 +912,11 @@ class BotGUI:
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         silence_threshold = 0.006
+        # Separate, higher bar for deciding speech has STARTED. Reusing silence_threshold
+        # for both meant a chair creak or passing car (>0.006) flipped speech_started,
+        # after which the follow-up abandon check could never fire and BMO sat listening
+        # for the full 10s. Real speech peaks ~0.10, so 0.015 clears room blips easily.
+        speech_threshold = silence_threshold * 2.5
         silence_duration = 1.5
         max_record_time = 30.0
         buffer = []
@@ -777,7 +955,7 @@ class BotGUI:
 
             if recorded_chunks < 5: return
 
-            if not speech_started[0] and volume_norm >= silence_threshold:
+            if not speech_started[0] and volume_norm >= speech_threshold:
                 speech_started[0] = True
                 events.append("Speech detected")
 
@@ -822,6 +1000,13 @@ class BotGUI:
                               f"elapsed={elapsed:.1f}s"
                               + (f" status={last_status[0]}" if last_status[0] else ""),
                               flush=True)
+
+                    # Hard ceiling on a follow-up attempt regardless of speech_started,
+                    # so a noise blip costs a few seconds at most, never the full timeout.
+                    if wait_for_speech and elapsed >= wait_for_speech + 5:
+                        print(f"[REC] follow-up window overran -> back to wake word", flush=True)
+                        abandoned = True
+                        break
 
                     if wait_for_speech and not speech_started[0] and elapsed >= wait_for_speech:
                         print(f"[REC] no follow-up within {wait_for_speech}s "
@@ -1044,7 +1229,12 @@ class BotGUI:
             if not final_text:
                 final_text = "BMO's brain went quiet. Ask me again?"
 
-            print(f"[LLM] response={final_text!r}", flush=True)
+            # Only keep the mic open if BMO actually needs an answer back. Lingering
+            # after every reply made him feel like he never went to sleep.
+            self.last_reply_was_question = final_text.rstrip().endswith("?")
+
+            print(f"[LLM] response={final_text!r} "
+                  f"question={self.last_reply_was_question}", flush=True)
 
             self.thinking_sound_active.clear()
             self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
