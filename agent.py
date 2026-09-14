@@ -207,7 +207,9 @@ Rules:
   know (maths, facts, chat) need no tool.
 - But when you DO need one, just use it. Never ask permission, never say you lack
   real-time access.
-- Anything current (news, weather, showtimes, prices, scores, hours) needs search_web."""
+- Anything current (news, weather, showtimes, prices, scores, hours) needs search_web.
+- The user's schedule, calendar, meetings, appointments or classes need get_agenda.
+- NEVER invent calendar events or describe what you see. Use the tool or say you cannot."""
 
 def build_system_prompt(mood_line=""):
     """Persona + live state, regenerated per turn.
@@ -261,7 +263,9 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_agenda",
-            "description": "Look at the user's calendar for a day.",
+            "description": ("Read the user's real calendar. Use for ANY question about "
+                            "their schedule, agenda, meetings, appointments, classes, "
+                            "plans, or what they have on today or tomorrow."),
             "parameters": {
                 "type": "object",
                 "properties": {
