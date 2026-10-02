@@ -358,10 +358,19 @@ def fetch_events(force=False):
                 continue
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=_local_tz())
+            # DTEND is what makes "already finished" and "happening now" knowable.
+            # Untimed entries often omit it, so assume an hour.
+            end_prop = ev.get("DTEND")
+            end_dt = getattr(end_prop, "dt", None) if end_prop is not None else None
+            if not isinstance(end_dt, datetime.datetime):
+                end_dt = dt + datetime.timedelta(hours=1)
+            elif end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=_local_tz())
             events.append({
                 "uid": f"{ev.get('UID', '')}-{dt.isoformat()}",
                 "summary": str(ev.get("SUMMARY", "something")),
                 "start": dt.astimezone(_local_tz()),
+                "end": end_dt.astimezone(_local_tz()),
             })
         events.sort(key=lambda e: e["start"])
 
@@ -398,7 +407,12 @@ def resolve_window(text):
         return ("within", mins, f"in the next {n} {m.group(2)}")
     if "tonight" in t or "this evening" in t:   return ("tonight", None, "tonight")
     if "this morning" in t:                     return ("morning", None, "this morning")
-    if "this afternoon" in t:                   return ("afternoon", None, "this afternoon")
+    if "after lunch" in t:
+        # Distinct from "this afternoon": the 12:00 band would include lunch itself.
+        return ("afternoon_late", None, "after lunch")
+    if ("this afternoon" in t
+            or "later today" in t and "morning" not in t):
+        return ("afternoon", None, "this afternoon")
     if "tomorrow" in t:                         return ("tomorrow", None, "tomorrow")
     if "next" in t or "coming up" in t or "soon" in t or "rest of" in t:
         return ("next", None, "next")
@@ -413,16 +427,25 @@ def events_in_window(kind, mins=None):
         return [e for e in evs if now <= e["start"] <= limit]
     if kind == "next":
         return [e for e in evs if e["start"] > now][:1]
+    # "Don't tell me what was on my calendar at 10am when it's noon." Anything whose
+    # end has passed is dropped from today's windows; an in-progress event is kept.
+    live = lambda e: e.get("end", e["start"]) > now
     if kind == "tonight":
-        return [e for e in evs if e["start"].date() == today and e["start"].hour >= 17]
+        return [e for e in evs if e["start"].date() == today
+                and e["start"].hour >= 17 and live(e)]
     if kind == "morning":
-        return [e for e in evs if e["start"].date() == today and e["start"].hour < 12]
+        return [e for e in evs if e["start"].date() == today
+                and e["start"].hour < 12 and live(e)]
     if kind == "afternoon":
-        return [e for e in evs if e["start"].date() == today and 12 <= e["start"].hour < 17]
+        return [e for e in evs if e["start"].date() == today
+                and 12 <= e["start"].hour < 17 and live(e)]
+    if kind == "afternoon_late":
+        return [e for e in evs if e["start"].date() == today
+                and 13 <= e["start"].hour < 17 and live(e)]
     if kind == "tomorrow":
         tm = today + datetime.timedelta(days=1)
         return [e for e in evs if e["start"].date() == tm]
-    return [e for e in evs if e["start"].date() == today]
+    return [e for e in evs if e["start"].date() == today and live(e)]
 
 SPOKEN_TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)", re.I)
 
@@ -436,17 +459,18 @@ def times_mentioned(s):
         out.add((h, mi))
     return out
 
-def agenda_facts():
-    """All known events with the time arithmetic ALREADY DONE.
+def agenda_facts(evs, label="today"):
+    """The ALREADY-FILTERED events, with the time arithmetic done.
 
-    A 1.5B model is poor at computing "how long until 6 PM" but fine at reading a
-    list. Precomputing the minutes turns reasoning into selection, which is what it
-    can actually do reliably.
+    Takes a filtered list rather than fetching: handing the model all 12 of the day's
+    events and asking it to pick made it claim a 72-minute-away event was "within 30
+    minutes". Python selects; the model only phrases what it is given, so it cannot
+    name an event that was never in its context.
     """
     now = datetime.datetime.now(tz=_local_tz())
-    evs = fetch_events()
     if not evs:
-        return f"Current time: {describe_time(now)}. The calendar is empty."
+        return (f"Current time: {describe_time(now)}. "
+                f"No events match ({label}).")
     lines = [f"Current time: {describe_time(now)}.", "Events:"]
     for e in evs:
         mins = int((e["start"] - now).total_seconds() // 60)
@@ -519,6 +543,8 @@ class BotGUI:
         
         self.last_ptt_time = 0 
         self.ptt_event = threading.Event()       
+        self._turn_id = 0        # bumped per turn and on interrupt; stale streams abort
+        self._t = {}             # per-turn timing stamps
         self.interject_event = threading.Event()   # set by the reminder ticker
         self.announced = set()                     # event uids already announced
         self.pending_interjection = None
@@ -636,6 +662,9 @@ class BotGUI:
 
     def handle_speaking_interrupt(self, event=None):
         if self.current_state == BotStates.SPEAKING or self.current_state == BotStates.THINKING:
+            # Bump the epoch FIRST: a still-running ollama stream checks this and
+            # abandons, otherwise it keeps queueing sentences after "stop".
+            self._turn_id += 1
             self.interrupted.set()
             self.thinking_sound_active.clear()
             with self.tts_queue_lock:
@@ -806,6 +835,34 @@ class BotGUI:
 
         return f"Tool '{name}' is not available."
 
+    def _drain_sentences(self, buf, turn):
+        """Queue every COMPLETE sentence in buf; return the unfinished remainder.
+
+        Sentence boundaries only -- speak() spawns a Piper process per utterance, so
+        per-token synthesis would be slower and choppier, not faster.
+        """
+        while True:
+            m = re.search(r'(?<=[.!?])\s+', buf)
+            if not m:
+                return buf
+            sentence, buf = buf[:m.start()].strip(), buf[m.end():]
+            if sentence and re.search(r'[a-zA-Z0-9]', sentence):
+                if turn != self._turn_id or self.interrupted.is_set():
+                    return ""                     # cancelled; drop late output
+                with self.tts_queue_lock:
+                    self.tts_queue.append(sentence)
+                if self._t.get("first_sentence") is None:
+                    self._t["first_sentence"] = time.time()
+
+    def _print_turn_timing(self):
+        t = self._t
+        def gap(a, b):
+            return f"{t[b] - t[a]:.1f}s" if t.get(a) and t.get(b) else "--"
+        print(f"[TIME] speech_end->transcript {gap('speech_end','transcript')} | "
+              f"transcript->first_sentence {gap('transcript','first_sentence')} | "
+              f"first_sentence->audible {gap('first_sentence','audible')} | "
+              f"SPEECH_END->AUDIBLE {gap('speech_end','audible')}", flush=True)
+
     def speak_text(self, text):
         """Split a finished reply into sentences and queue them for Piper."""
         for part in re.split(r'(?<=[.!?])\s+', text):
@@ -867,7 +924,10 @@ class BotGUI:
                             self.set_state(BotStates.IDLE, "Heard nothing.")
                         break
 
+                    self._t = {"speech_end": time.time()}
+                    self._turn_id += 1
                     user_text = self.transcribe_audio(audio_file)
+                    self._t["transcript"] = time.time()
                     if not user_text:
                         if not follow_up:
                             self.set_state(BotStates.IDLE, "Transcription empty.")
@@ -876,6 +936,7 @@ class BotGUI:
                     self.append_to_text(f"YOU: {user_text}")
                     self.interrupted.clear()
                     self.chat_and_respond(user_text, img_path=None)
+                    self._print_turn_timing()
 
                     # Spacebar interrupt must escape the conversation, not just the reply.
                     if self.interrupted.is_set():
@@ -1322,17 +1383,18 @@ class BotGUI:
                 self.set_state(BotStates.IDLE, "Ready")
                 return
 
-            calendar_events = fetch_events()
-            facts = agenda_facts()
-            print(f"[PREROUTE] calendar -> {len(calendar_events)} events, LLM reasoning",
-                  flush=True)
+            kind, mins, label = resolve_window(text)
+            calendar_events = events_in_window(kind, mins)
+            facts = agenda_facts(calendar_events, label)
+            print(f"[PREROUTE] calendar window={kind} ({label}) -> "
+                  f"{len(calendar_events)} matching events", flush=True)
             print(f"[PREROUTE] facts:\n{facts}", flush=True)
             messages = [system_msg, {"role": "user", "content":
-                f"{text}\n\nCalendar data:\n{facts}\n\n"
+                f"{text}\n\nCalendar data for {label}:\n{facts}\n\n"
                 f"Answer ONLY the question asked, using ONLY this data. "
-                f"Do NOT list other events. If the question is about one event or a "
-                f"time range, mention just that. If nothing matches, say so briefly. "
-                f"Give times exactly as shown."}]
+                f"This is the USER's calendar, not yours: say \"you\" and \"your\", "
+                f"never \"I\" or \"my\". "
+                f"If nothing matches, say so briefly. Give times exactly as shown."}]
 
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
@@ -1346,13 +1408,53 @@ class BotGUI:
             if calendar_events is not None:
                 call_options = dict(OLLAMA_OPTIONS)
                 call_options["num_predict"] = 220     # room to answer, not to ramble
+                # Measured: at 0.7 the same calendar question gave 3 different answers
+                # in 3 runs, one of them wrong ("Yes, I am free tonight" with two
+                # events listed). At 0 it is correct and identical every time.
+                call_options["temperature"] = 0.0
             kwargs = {"model": model_to_use, "messages": messages, "options": call_options}
             if not img_path and calendar_events is None:
                 kwargs["tools"] = TOOLS
+            # --- streamed: speak each COMPLETE sentence as it arrives ---
+            # Tool-call fragments are accumulated separately and NEVER spoken, so raw
+            # arguments can't be voiced and nothing claims success before run_tool().
+            # A tool-calling response from Ollama carries empty content, so a tool turn
+            # stays silent here and pass 2 does the talking.
             _t0 = time.time()
-            resp = ollama.chat(**kwargs)
-            msg = resp["message"]
-            print(f"[LLM] pass1 {time.time() - _t0:.1f}s", flush=True)
+            turn = self._turn_id
+            buf, calls, streamed = "", [], ""
+            spoke_while_streaming = False
+
+            for chunk in ollama.chat(**kwargs, stream=True):
+                if self.interrupted.is_set() or turn != self._turn_id:
+                    print("[LLM] stream abandoned (interrupted)", flush=True)
+                    break
+                m = chunk.get("message", {}) or {}
+                tc = m.get("tool_calls")
+                if tc:
+                    calls.extend(tc)
+                content = m.get("content", "") or ""
+                if content:
+                    if self._t.get("llm_first") is None:
+                        self._t["llm_first"] = time.time()
+                    self.thinking_sound_active.clear()
+                    if not spoke_while_streaming and not calls:
+                        self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+                        self.append_to_text("BOT: ", newline=False)
+                        spoke_while_streaming = True
+                    streamed += content
+                    buf += content
+                    if not calls:
+                        buf = self._drain_sentences(buf, turn)
+
+            # trailing partial sentence
+            if buf.strip() and not calls and turn == self._turn_id \
+                    and not self.interrupted.is_set():
+                with self.tts_queue_lock:
+                    self.tts_queue.append(buf.strip())
+            msg = {"content": streamed, "tool_calls": calls}
+            print(f"[LLM] pass1 {time.time() - _t0:.1f}s "
+                  f"streamed={len(streamed)}ch tools={len(calls)}", flush=True)
 
             calls = msg.get("tool_calls") or []
             print(f"[ROUTER] tool_calls={[c['function']['name'] for c in calls]}", flush=True)
@@ -1378,9 +1480,24 @@ class BotGUI:
                 # Pass 2: let BMO phrase the tool result in his own voice.
                 self.set_state(BotStates.THINKING, "Reading...", cam_path=img_path)
                 _t1 = time.time()
-                resp = ollama.chat(model=model_to_use, messages=messages,
-                                   options=OLLAMA_OPTIONS)
-                msg = resp["message"]
+                buf2, streamed2 = "", ""
+                for chunk in ollama.chat(model=model_to_use, messages=messages,
+                                         options=OLLAMA_OPTIONS, stream=True):
+                    if self.interrupted.is_set() or turn != self._turn_id:
+                        break
+                    c = (chunk.get("message", {}) or {}).get("content", "") or ""
+                    if c:
+                        if not spoke_while_streaming:
+                            self.thinking_sound_active.clear()
+                            self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+                            self.append_to_text("BOT: ", newline=False)
+                            spoke_while_streaming = True
+                        streamed2 += c
+                        buf2 = self._drain_sentences(buf2 + c, turn)
+                if buf2.strip() and turn == self._turn_id and not self.interrupted.is_set():
+                    with self.tts_queue_lock:
+                        self.tts_queue.append(buf2.strip())
+                msg = {"content": streamed2}
                 print(f"[LLM] pass2 {time.time() - _t1:.1f}s", flush=True)
 
             final_text = (msg.get("content") or "").strip()
@@ -1404,6 +1521,7 @@ class BotGUI:
                 except Exception as e:
                     print(f"[VISION] re-voice failed, using raw: {e}", flush=True)
 
+            replaced_answer = False
             if not final_text:
                 final_text = "BMO's brain went quiet. Ask me again?"
 
@@ -1421,8 +1539,9 @@ class BotGUI:
                     print(f"[PREROUTE] invented time(s) {sorted(invented)} "
                           f"-> deterministic fallback", flush=True)
                     final_text = format_agenda(
-                        calendar_events, "today",
+                        calendar_events, label,
                         CURRENT_CONFIG.get("user_name", "").strip())
+                    replaced_answer = True
 
             # Only keep the mic open if BMO actually needs an answer back. Lingering
             # after every reply made him feel like he never went to sleep.
@@ -1432,10 +1551,20 @@ class BotGUI:
                   f"question={self.last_reply_was_question}", flush=True)
 
             self.thinking_sound_active.clear()
-            self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
-            self.append_to_text("BOT: ", newline=False)
-            self.append_to_text(final_text, newline=True)
-            self.speak_text(final_text)
+
+            if spoke_while_streaming and not replaced_answer:
+                # Already spoken sentence-by-sentence during the stream.
+                self.append_to_text("", newline=True)
+            else:
+                # Nothing streamed (tool-only turn, vision re-voice, or the fabrication
+                # fallback replaced the answer) -- speak it now.
+                if replaced_answer:
+                    with self.tts_queue_lock:
+                        self.tts_queue.clear()      # drop the invented sentences
+                self.set_state(BotStates.SPEAKING, "Speaking...", cam_path=img_path)
+                self.append_to_text("BOT: ", newline=False)
+                self.append_to_text(final_text, newline=True)
+                self.speak_text(final_text)
 
             self.session_memory.append({"role": "user", "content": text})
             self.session_memory.append({"role": "assistant", "content": final_text})
@@ -1470,6 +1599,8 @@ class BotGUI:
         clean = re.sub(r"[^\w\s,.!?:-]", "", text)
         if not clean.strip(): return
         
+        if self._t.get("audible") is None:
+            self._t["audible"] = time.time()
         print(f"[PIPER SPEAKING] '{clean}'", flush=True)
         voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
         
@@ -1515,7 +1646,10 @@ class BotGUI:
                         stream.write(audio_chunk.tobytes())
                     else:
                         self.current_volume = 0
-                time.sleep(0.5) 
+                # Short drain so the tail of the sentence isn't clipped. Was 0.5s, which
+                # was invisible when one blob was spoken per turn but becomes half a
+                # second of dead air between EVERY sentence once streaming is restored.
+                time.sleep(0.08)
                     
         except Exception as e:
             print(f"Audio Error: {e}")
