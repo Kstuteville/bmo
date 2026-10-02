@@ -424,6 +424,18 @@ def events_in_window(kind, mins=None):
         return [e for e in evs if e["start"].date() == tm]
     return [e for e in evs if e["start"].date() == today]
 
+SPOKEN_TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)", re.I)
+
+def times_mentioned(s):
+    """Clock times in a sentence, normalised to (hour, minute) 24h."""
+    out = set()
+    for m in SPOKEN_TIME_RE.finditer(s):
+        h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3).lower()[0]
+        if ap == "p" and h != 12: h += 12
+        if ap == "a" and h == 12: h = 0
+        out.add((h, mi))
+    return out
+
 def agenda_facts():
     """All known events with the time arithmetic ALREADY DONE.
 
@@ -1317,8 +1329,10 @@ class BotGUI:
             print(f"[PREROUTE] facts:\n{facts}", flush=True)
             messages = [system_msg, {"role": "user", "content":
                 f"{text}\n\nCalendar data:\n{facts}\n\n"
-                f"Answer the question using ONLY this data. Give times exactly as shown. "
-                f"If nothing matches the question, say so."}]
+                f"Answer ONLY the question asked, using ONLY this data. "
+                f"Do NOT list other events. If the question is about one event or a "
+                f"time range, mention just that. If nothing matches, say so briefly. "
+                f"Give times exactly as shown."}]
 
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
@@ -1397,10 +1411,15 @@ class BotGUI:
             # If the answer names none of the real events, the model invented it.
             # Speak the exact list rather than fiction.
             if calendar_events:
-                spoken = final_text.lower()
-                if not any(e["summary"].lower()[:12] in spoken for e in calendar_events):
-                    print("[PREROUTE] answer ignored the data -> deterministic fallback",
-                          flush=True)
+                # Fabrication = stating a time no real event has. The previous check
+                # demanded the answer NAME an event, which clobbered correct short
+                # answers like "Nothing in the next 30 minutes!" and replaced them with
+                # a dump of the whole day.
+                real = {(e["start"].hour, e["start"].minute) for e in calendar_events}
+                invented = times_mentioned(final_text) - real
+                if invented:
+                    print(f"[PREROUTE] invented time(s) {sorted(invented)} "
+                          f"-> deterministic fallback", flush=True)
                     final_text = format_agenda(
                         calendar_events, "today",
                         CURRENT_CONFIG.get("user_name", "").strip())
