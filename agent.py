@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
     "input_device": None,
     "input_sample_rate": None,
     "calendar_ics_url": "",          # put the real one in secrets.json, not here
+    "calendar_preroute": True,       # False -> let the LLM try tool calling instead
     "reminder_lead_minutes": 30,
     "calendar_poll_minutes": 5
 }
@@ -245,6 +246,13 @@ CALENDAR_RE = re.compile(
     r"\b(calendar|schedule|agenda|meeting|meetings|appointment|appointments"
     r"|class|classes|plans)\b", re.I)
 
+# Checked BEFORE the read path. Without this, "add lunch to my calendar" matches
+# CALENDAR_RE, reads the calendar, and answers as though it added something -- a
+# failure that sounds like success. The iCal feed is read-only by protocol.
+CALENDAR_WRITE_RE = re.compile(
+    r"\b(add|create|book|schedule|put|make|set up|remind me to)\b[^.?]*\b"
+    r"(calendar|meeting|appointment|event)\b", re.I)
+
 # --- TOOL SCHEMAS (Ollama native function calling) ---
 # The runtime validates these, so the model cannot invent a tool name or a
 # parameter key. This replaces regex-scraping JSON out of prose.
@@ -373,6 +381,73 @@ def events_for_day(day="today"):
     target = (now + datetime.timedelta(days=1)).date() if str(day).lower().startswith("tomorrow") else now.date()
     return [e for e in fetch_events() if e["start"].date() == target]
 
+DURATION_RE = re.compile(r"\bin\s+(?:the\s+)?(?:next\s+)?(\d+)\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b", re.I)
+
+def resolve_window(text):
+    """Map a question to a time window. Explicit periods beat 'next'.
+
+    Without this every calendar question returned the whole day, so 'what do I have
+    in 30 minutes' listed all five of today's events.
+    Returns (kind, minutes_or_None, spoken_label).
+    """
+    t = text.lower()
+    m = DURATION_RE.search(t)
+    if m:
+        n = int(m.group(1))
+        mins = n * (60 if m.group(2).lower().startswith(("hour", "hr")) else 1)
+        return ("within", mins, f"in the next {n} {m.group(2)}")
+    if "tonight" in t or "this evening" in t:   return ("tonight", None, "tonight")
+    if "this morning" in t:                     return ("morning", None, "this morning")
+    if "this afternoon" in t:                   return ("afternoon", None, "this afternoon")
+    if "tomorrow" in t:                         return ("tomorrow", None, "tomorrow")
+    if "next" in t or "coming up" in t or "soon" in t or "rest of" in t:
+        return ("next", None, "next")
+    return ("today", None, "today")
+
+def events_in_window(kind, mins=None):
+    now = datetime.datetime.now(tz=_local_tz())
+    evs = fetch_events()
+    today = now.date()
+    if kind == "within":
+        limit = now + datetime.timedelta(minutes=mins)
+        return [e for e in evs if now <= e["start"] <= limit]
+    if kind == "next":
+        return [e for e in evs if e["start"] > now][:1]
+    if kind == "tonight":
+        return [e for e in evs if e["start"].date() == today and e["start"].hour >= 17]
+    if kind == "morning":
+        return [e for e in evs if e["start"].date() == today and e["start"].hour < 12]
+    if kind == "afternoon":
+        return [e for e in evs if e["start"].date() == today and 12 <= e["start"].hour < 17]
+    if kind == "tomorrow":
+        tm = today + datetime.timedelta(days=1)
+        return [e for e in evs if e["start"].date() == tm]
+    return [e for e in evs if e["start"].date() == today]
+
+def agenda_facts():
+    """All known events with the time arithmetic ALREADY DONE.
+
+    A 1.5B model is poor at computing "how long until 6 PM" but fine at reading a
+    list. Precomputing the minutes turns reasoning into selection, which is what it
+    can actually do reliably.
+    """
+    now = datetime.datetime.now(tz=_local_tz())
+    evs = fetch_events()
+    if not evs:
+        return f"Current time: {describe_time(now)}. The calendar is empty."
+    lines = [f"Current time: {describe_time(now)}.", "Events:"]
+    for e in evs:
+        mins = int((e["start"] - now).total_seconds() // 60)
+        day = "today" if e["start"].date() == now.date() else "tomorrow"
+        if mins < 0:
+            when = "already passed"
+        elif mins < 60:
+            when = f"in {mins} minutes"
+        else:
+            when = f"in {mins // 60}h {mins % 60}m"
+        lines.append(f"- {e['summary']} {day} at {describe_time(e['start'])} ({when})")
+    return "\n".join(lines)
+
 def format_agenda(events, day="today", who=""):
     """Build the spoken calendar answer with no model involved.
 
@@ -383,6 +458,16 @@ def format_agenda(events, day="today", who=""):
     lead = f"Okay {who}! " if who else "Okay! "
     if not events:
         return f"{lead}Nothing on your calendar {day}."
+
+    # "what's next" wants the relative time -- that's the useful part of the answer.
+    if day == "next":
+        e = events[0]
+        now = datetime.datetime.now(tz=_local_tz())
+        mins = int((e["start"] - now).total_seconds() // 60)
+        when = (f"in {mins} minutes" if mins < 60
+                else f"in about {round(mins / 60)} hour{'s' if round(mins / 60) != 1 else ''}")
+        return f"{lead}Next up is {e['summary']} at {describe_time(e['start'])}, {when}."
+
     parts = [f"{e['summary']} at {describe_time(e['start'])}." for e in events]
     n = len(parts)
     return f"{lead}You have {n} thing{'s' if n != 1 else ''} {day}. " + " Then ".join(parts)
@@ -1204,25 +1289,36 @@ class BotGUI:
             history = (self.permanent_memory + self.session_memory)[-MEMORY_TURNS:]
             messages = [system_msg] + history + [{"role": "user", "content": text}]
 
-        # --- calendar: answered entirely without the model ---
-        if not img_path and CALENDAR_RE.search(text):
-            day = "tomorrow" if "tomorrow" in text.lower() else "today"
-            print(f"[PREROUTE] calendar -> get_agenda({day})", flush=True)
-            events = events_for_day(day)
-            print(f"[PREROUTE] {len(events)} events, answering without the model", flush=True)
+        # --- calendar: the FETCH is forced; the LLM only reasons over it ---
+        # Tool selection at 1.5B failed (tool_calls=[] every time), so we never ask the
+        # model whether to look. We look, hand it real events with the time maths already
+        # done, and let it answer the question actually asked.
+        # Set "calendar_preroute": false to send these to the model with tools instead.
+        calendar_events = None
+        if (CURRENT_CONFIG.get("calendar_preroute", True)
+                and not img_path and CALENDAR_RE.search(text)):
 
-            final_text = format_agenda(events, day,
-                                       CURRENT_CONFIG.get("user_name", "").strip())
-            self.set_state(BotStates.SPEAKING, "Speaking...")
-            self.append_to_text("BOT: ", newline=False)
-            self.append_to_text(final_text, newline=True)
-            self.speak_text(final_text)
-            self.session_memory.append({"role": "user", "content": text})
-            self.session_memory.append({"role": "assistant", "content": final_text})
-            self.last_reply_was_question = False
-            self.wait_for_tts()
-            self.set_state(BotStates.IDLE, "Ready")
-            return
+            if CALENDAR_WRITE_RE.search(text):
+                print("[PREROUTE] calendar WRITE intent -> refusing honestly", flush=True)
+                refusal = "BMO can't add things to your calendar yet, only look at it!"
+                self.set_state(BotStates.SPEAKING, "Speaking...")
+                self.append_to_text("BOT: ", newline=False)
+                self.append_to_text(refusal, newline=True)
+                self.speak_text(refusal)
+                self.last_reply_was_question = False
+                self.wait_for_tts()
+                self.set_state(BotStates.IDLE, "Ready")
+                return
+
+            calendar_events = fetch_events()
+            facts = agenda_facts()
+            print(f"[PREROUTE] calendar -> {len(calendar_events)} events, LLM reasoning",
+                  flush=True)
+            print(f"[PREROUTE] facts:\n{facts}", flush=True)
+            messages = [system_msg, {"role": "user", "content":
+                f"{text}\n\nCalendar data:\n{facts}\n\n"
+                f"Answer the question using ONLY this data. Give times exactly as shown. "
+                f"If nothing matches the question, say so."}]
 
         self.thinking_sound_active.set()
         threading.Thread(target=self._run_thinking_sound_loop, daemon=True).start()
@@ -1232,8 +1328,12 @@ class BotGUI:
 
             # Pass 1: the model either answers, or asks for a tool. The vision model
             # has no tool template, so tools are only offered on the text path.
-            kwargs = {"model": model_to_use, "messages": messages, "options": OLLAMA_OPTIONS}
-            if not img_path:
+            call_options = OLLAMA_OPTIONS
+            if calendar_events is not None:
+                call_options = dict(OLLAMA_OPTIONS)
+                call_options["num_predict"] = 220     # room to answer, not to ramble
+            kwargs = {"model": model_to_use, "messages": messages, "options": call_options}
+            if not img_path and calendar_events is None:
                 kwargs["tools"] = TOOLS
             _t0 = time.time()
             resp = ollama.chat(**kwargs)
@@ -1293,6 +1393,17 @@ class BotGUI:
             if not final_text:
                 final_text = "BMO's brain went quiet. Ask me again?"
 
+
+            # If the answer names none of the real events, the model invented it.
+            # Speak the exact list rather than fiction.
+            if calendar_events:
+                spoken = final_text.lower()
+                if not any(e["summary"].lower()[:12] in spoken for e in calendar_events):
+                    print("[PREROUTE] answer ignored the data -> deterministic fallback",
+                          flush=True)
+                    final_text = format_agenda(
+                        calendar_events, "today",
+                        CURRENT_CONFIG.get("user_name", "").strip())
 
             # Only keep the mic open if BMO actually needs an answer back. Lingering
             # after every reply made him feel like he never went to sleep.

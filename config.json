@@ -1,5 +1,6 @@
 {
   "text_model": "qwen2.5:1.5b",
+  "calendar_preroute": true,
   "user_name": "Kaylie",
   "follow_up_seconds": 6,
   "memory_turns": 8,
